@@ -1,8 +1,13 @@
 ﻿// WheelGuard: tray tool for a mouse whose wheel (middle) button sticks.
 //  - Hotkey (default Ctrl+Alt+W), the tray menu or the window toggles the wheel click on/off.
 //  - While enabled it only polls the middle-button state; if Windows sees it held longer
-//    than holdSeconds (longHoldSeconds in longHoldApps, e.g. Blender), the wheel click is
-//    switched off automatically and the stuck state in Windows is released.
+//    than holdSeconds (longHoldSeconds in longHoldApps, e.g. Blender), the stuck state is
+//    force-released in Windows (repeatedly, until it takes). With autoDisable the wheel
+//    click is switched off as well. A leftover hold with the physical button already
+//    released is force-released within 0.5 s in any mode. No balloon notifications.
+//  - Optional remap (armoury-crate style): with the click enabled and remap set (a key
+//    combo or X1/X2/Left/Right) the physical wheel press is swallowed and sent as that
+//    key or button instead — press-and-hold works, and a stuck wheel releases it.
 //  - While disabled, a low-level mouse hook swallows physical middle-button events.
 //    The hook exists only in that mode, so normal use adds no input latency.
 //  - The physical button state (window, optional tray indicator) comes from raw input on a
@@ -29,6 +34,8 @@ namespace WheelGuard
         public const int WH_MOUSE_LL = 14;
         public const int WM_MBUTTONDOWN = 0x207, WM_MBUTTONUP = 0x208, WM_HOTKEY = 0x312, WM_INPUT = 0xFF;
         public const uint MOUSEEVENTF_MIDDLEUP = 0x40, MOD_NOREPEAT = 0x4000;
+        public const uint MOUSEEVENTF_LEFTDOWN = 0x2, MOUSEEVENTF_LEFTUP = 0x4, MOUSEEVENTF_RIGHTDOWN = 0x8, MOUSEEVENTF_RIGHTUP = 0x10,
+            MOUSEEVENTF_XDOWN = 0x80, MOUSEEVENTF_XUP = 0x100, KEYEVENTF_KEYUP = 2;
         public const uint RIDEV_REMOVE = 0x1, RIDEV_INPUTSINK = 0x100, RID_INPUT = 0x10000003;
 
         [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
@@ -47,6 +54,7 @@ namespace WheelGuard
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
         [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
+        [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
         [DllImport("user32.dll")] public static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
         [DllImport("user32.dll")] public static extern uint GetRawInputData(IntPtr hRawInput, uint command, IntPtr data, ref uint size, uint headerSize);
@@ -61,6 +69,7 @@ namespace WheelGuard
         public int HoldSeconds = 5, LongHoldSeconds = 60;
         public string LongHoldApps = "blender";
         public string Hotkey = "Ctrl+Alt+W";
+        public string Remap = "";
         public readonly string Path;
 
         public Settings(string path)
@@ -84,6 +93,7 @@ namespace WheelGuard
                     case "longholdseconds": if (int.TryParse(v, out n) && n > 0) LongHoldSeconds = n; break;
                     case "longholdapps": LongHoldApps = v; break;
                     case "hotkey": Hotkey = v; break;
+                    case "remap": Remap = v; break;
                 }
             }
         }
@@ -102,6 +112,8 @@ namespace WheelGuard
                 "longHoldApps=" + LongHoldApps,
                 "# e.g. Ctrl+Alt+W, Ctrl+Shift+F12, Win+Alt+W",
                 "hotkey=" + Hotkey,
+                "# remap the wheel press to another key/combo or mouse button: X1, X2, Left, Right, F6, Ctrl+C; empty = off",
+                "remap=" + Remap,
                 "# show the physical wheel-button state on the tray icon",
                 "trayIndicator=" + (TrayIndicator ? 1 : 0),
             }, new UTF8Encoding(false));
@@ -201,6 +213,9 @@ namespace WheelGuard
         readonly MainForm form;
         string[] longApps;
         string hotkeyText;
+        bool remapOn, remapHeld;
+        uint remapMods, remapVk;   // keyboard remap: modifier bits + virtual key
+        int remapMouse;            // 0 keyboard, 1 left, 2 right, 3 X1, 4 X2
 
         IntPtr hook;
         volatile bool hookActive;
@@ -209,6 +224,7 @@ namespace WheelGuard
         long lastEdgeTicks;
         int chatter, autoTrips;
         int heldSince;             // enabled mode: tick when Windows started reporting M held (0 = not held)
+        int phantomHeldSince;      // any mode: tick when Windows held + physical released was first seen
         int strayHeldSince;        // disabled mode: tick when a leftover held state was first seen
         long hookEvents, lastHookEvents, blocked;
         Native.POINT lastPos;
@@ -269,6 +285,11 @@ namespace WheelGuard
             form = new MainForm(this);
             form.VisibleChanged += delegate { UpdateRawListening(); };
 
+            if (cfg.Remap.Trim().Length > 0)
+            {
+                string remapErr = SetRemap(cfg.Remap);
+                if (remapErr != null) Log("remap '" + cfg.Remap + "' ignored: " + remapErr);
+            }
             ApplyHookState();
             UpdateRawListening();
             UpdateTray();
@@ -277,6 +298,7 @@ namespace WheelGuard
             timer.Tick += Tick;
             timer.Start();
             Log("start: wheel click " + (cfg.Enabled ? "ON" : "OFF") + ", hotkey " + (hotkeyText ?? "none")
+                + (remapOn ? ", remap " + cfg.Remap : "")
                 + ", hold limit " + cfg.HoldSeconds + " s (" + cfg.LongHoldSeconds + " s in " + cfg.LongHoldApps + ")");
         }
 
@@ -290,6 +312,7 @@ namespace WheelGuard
         public int Chatter { get { return chatter; } }
         public int AutoTrips { get { return autoTrips; } }
         public string HotkeyText { get { return hotkeyText; } }
+        public bool RemapOn { get { return remapOn; } }
         public Icon WindowIcon { get { return GetIcon(IconReleased); } }
 
         void Tick(object sender, EventArgs e)
@@ -297,6 +320,7 @@ namespace WheelGuard
             DrainEvents();
             int now = Environment.TickCount;
             windowsHeld = Native.MiddleHeld();
+            ClearPhantomHold(now);
             if (cfg.Enabled) CheckStuck(now);
             else
             {
@@ -309,16 +333,48 @@ namespace WheelGuard
 
         void CheckStuck(int now)
         {
-            if (!windowsHeld) { heldSince = 0; return; }
+            // With a remap active the wheel never reaches Windows, so watch the physical
+            // state the hook reports instead of what Windows sees.
+            bool held = remapOn ? physState == 1 : windowsHeld;
+            if (!held) { heldSince = 0; return; }
             if (heldSince == 0) { heldSince = now; return; }
-            if (!cfg.AutoDisable) return;
             int limitMs = (IsLongHoldApp() ? cfg.LongHoldSeconds : cfg.HoldSeconds) * 1000;
-            if (now - heldSince > limitMs)
+            int elapsed = now - heldSince;
+            if (elapsed > limitMs)
             {
-                tripped = true;
-                autoTrips++;
-                SetEnabled(false, "колесо зажато " + (now - heldSince) / 1000 + " с");
+                // Forced release always happens; autoDisable additionally cuts the click off.
+                if (remapOn)
+                {
+                    if (remapHeld)
+                    {
+                        remapHeld = false;
+                        SendRemap(false);
+                        Log("remapped key released (колесо зажато " + elapsed / 1000 + " с)");
+                    }
+                }
+                else ReleaseMiddle("колесо зажато " + elapsed / 1000 + " с");
+                heldSince = 0;
+                if (cfg.AutoDisable)
+                {
+                    tripped = true;
+                    autoTrips++;
+                    SetEnabled(false, "колесо зажато " + elapsed / 1000 + " с");
+                }
             }
+        }
+
+        // Windows reports the wheel held while the physical button is already released —
+        // a leftover stuck state. Force it loose quickly in any mode, even with
+        // autoDisable off. Needs the raw listener (tray indicator on or window open);
+        // with the physical state unknown this check stays idle.
+        void ClearPhantomHold(int now)
+        {
+            if (windowsHeld && physState == 0)
+            {
+                if (phantomHeldSince == 0) phantomHeldSince = now;
+                else if (now - phantomHeldSince > 500) { ReleaseMiddle("Windows залипло при отпущенной кнопке"); phantomHeldSince = 0; }
+            }
+            else phantomHeldSince = 0;
         }
 
         // Disabled: nothing physical can hold M any more, so a held state is a leftover.
@@ -354,13 +410,15 @@ namespace WheelGuard
             {
                 hookEvents++;
                 int msg = wParam.ToInt32();
-                if ((msg == Native.WM_MBUTTONDOWN || msg == Native.WM_MBUTTONUP) && !cfg.Enabled)
+                if (msg == Native.WM_MBUTTONDOWN || msg == Native.WM_MBUTTONUP)
                 {
                     uint flags = (uint)Marshal.ReadInt32(lParam, 12);   // MSLLHOOKSTRUCT.flags
-                    if ((flags & 1) == 0)                               // physical, not injected
+                    if ((flags & 1) == 0 && (!cfg.Enabled || remapOn))  // physical and being swallowed
                     {
                         bool down = msg == Native.WM_MBUTTONDOWN;
-                        if (down) blocked++;
+                        if (!cfg.Enabled) { if (down) blocked++; }
+                        else if (down) { remapHeld = true; SendRemap(true); }
+                        else if (remapHeld) { remapHeld = false; SendRemap(false); }
                         events.Enqueue(new MiddleEvent { Down = down, Blocked = true, Ticks = Stopwatch.GetTimestamp(), Time = DateTime.Now });
                         return (IntPtr)1;
                     }
@@ -406,26 +464,22 @@ namespace WheelGuard
             cfg.Save();
             if (on) tripped = false;
             ApplyHookState();
+            if (!on && remapHeld) { remapHeld = false; SendRemap(false); }
             if (!on && Native.MiddleHeld()) ReleaseMiddle(null);
             heldSince = 0;
+            phantomHeldSince = 0;
             strayHeldSince = 0;
             Log("wheel click " + (on ? "ON" : "OFF") + " (" + reason + ")" + (on ? ", blocked presses while off: " + blocked : ""));
             if (on) blocked = 0;
             UpdateTray();
             if (form.Visible) form.RefreshState();
-
-            string how = hotkeyText != null ? hotkeyText : "меню в трее";
-            if (!on && tripped)
-                tray.ShowBalloonTip(5000, "Колесо залипло",
-                    "Клик колесом отключён (" + reason + ").\n" + how + " — включить обратно.", ToolTipIcon.Warning);
-            else
-                tray.ShowBalloonTip(1500, "WheelGuard", on ? "Клик колесом включён" : "Клик колесом выключен", ToolTipIcon.Info);
         }
 
         void ApplyHookState()
         {
-            if (!cfg.Enabled && hook == IntPtr.Zero) InstallHook();
-            else if (cfg.Enabled && hook != IntPtr.Zero)
+            bool wantHook = !cfg.Enabled || remapOn;
+            if (wantHook && hook == IntPtr.Zero) InstallHook();
+            else if (!wantHook && hook != IntPtr.Zero)
             {
                 Native.UnhookWindowsHookEx(hook);
                 hook = IntPtr.Zero;
@@ -457,7 +511,13 @@ namespace WheelGuard
 
         public void ReleaseMiddle(string why)
         {
-            Native.mouse_event(Native.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
+            // A single injected MBUTTONUP can get swallowed; keep injecting until
+            // Windows actually stops seeing the button held.
+            for (int i = 0; i < 10 && Native.MiddleHeld(); i++)
+            {
+                Native.mouse_event(Native.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(10);
+            }
             if (why != null) Log("released middle button in Windows (" + why + ")");
         }
 
@@ -501,6 +561,73 @@ namespace WheelGuard
             return null;
         }
 
+        // Remap the wheel press to a key combo or another mouse button; "" or "none" turns it off.
+        // Returns null on success, otherwise a short reason.
+        public string SetRemap(string text)
+        {
+            text = text.Trim();
+            int mouse = 0;
+            uint mods = 0, vk = 0;
+            if (text.Length != 0)
+            {
+                string low = text.ToLowerInvariant();
+                if (low == "left" || low == "лкм") mouse = 1;
+                else if (low == "right" || low == "пкм") mouse = 2;
+                else if (low == "x1" || low == "mouse4") mouse = 3;
+                else if (low == "x2" || low == "mouse5") mouse = 4;
+                else if (!ParseHotkey(text, out mods, out vk)) return "не понял сочетание";
+                else if (vk == 4) return "колесо нельзя биндить на себя";
+                else
+                {
+                    uint hm, hv;
+                    if (hotkeyText != null && ParseHotkey(hotkeyText, out hm, out hv) && hm == mods && hv == vk)
+                        return "совпадает с хоткеем программы";
+                }
+            }
+            if (remapHeld) { SendRemap(false); remapHeld = false; }
+            remapMouse = mouse;
+            remapMods = mods;
+            remapVk = vk;
+            cfg.Remap = text;
+            cfg.Save();
+            remapOn = mouse > 0 || vk != 0;
+            ApplyHookState();
+            UpdateTray();
+            Log("remap " + (remapOn ? text : "off"));
+            return null;
+        }
+
+        // Presses/releases the remapped target. Modifiers go down first and come up last.
+        void SendRemap(bool down)
+        {
+            if (remapMouse > 0)
+            {
+                uint flags = remapMouse == 1 ? (down ? Native.MOUSEEVENTF_LEFTDOWN : Native.MOUSEEVENTF_LEFTUP)
+                           : remapMouse == 2 ? (down ? Native.MOUSEEVENTF_RIGHTDOWN : Native.MOUSEEVENTF_RIGHTUP)
+                           : (down ? Native.MOUSEEVENTF_XDOWN : Native.MOUSEEVENTF_XUP);
+                uint data = remapMouse >= 3 ? (uint)(remapMouse - 2) : 0;   // XBUTTON: 1 = X1, 2 = X2
+                Native.mouse_event(flags, 0, 0, data, UIntPtr.Zero);
+            }
+            else
+            {
+                var modVks = new List<byte>();
+                if ((remapMods & 2) != 0) modVks.Add(0x11);   // Ctrl
+                if ((remapMods & 1) != 0) modVks.Add(0x12);   // Alt
+                if ((remapMods & 4) != 0) modVks.Add(0x10);   // Shift
+                if ((remapMods & 8) != 0) modVks.Add(0x5B);   // LWin
+                if (down)
+                {
+                    foreach (byte m in modVks) Native.keybd_event(m, 0, 0, UIntPtr.Zero);
+                    Native.keybd_event((byte)remapVk, 0, 0, UIntPtr.Zero);
+                }
+                else
+                {
+                    Native.keybd_event((byte)remapVk, 0, Native.KEYEVENTF_KEYUP, UIntPtr.Zero);
+                    for (int i = modVks.Count - 1; i >= 0; i--) Native.keybd_event(modVks[i], 0, Native.KEYEVENTF_KEYUP, UIntPtr.Zero);
+                }
+            }
+        }
+
         bool IsLongHoldApp()
         {
             uint pid;
@@ -535,6 +662,7 @@ namespace WheelGuard
 
             string tip = "WheelGuard — колесо " + (cfg.Enabled ? "ВКЛ" : (tripped ? "ВЫКЛ (залипало)" : "ВЫКЛ"));
             if (!cfg.Enabled && blocked > 0) tip += ", заглушено " + blocked;
+            if (cfg.Enabled && remapOn) tip += " · бинд: " + cfg.Remap;
             if (cfg.Enabled && cfg.TrayIndicator) tip += pressed ? " · НАЖАТА" : " · отпущена";
             if (tip.Length > 63) tip = tip.Substring(0, 63);
             if (tip != shownTip) { tray.Text = tip; shownTip = tip; }
@@ -634,6 +762,7 @@ namespace WheelGuard
         public void Dispose()
         {
             timer.Stop();
+            if (remapHeld) SendRemap(false);
             if (hook != IntPtr.Zero) { Native.UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
             Native.UnregisterHotKey(Handle, HotkeyId);
             raw.SetListening(false);
@@ -650,12 +779,12 @@ namespace WheelGuard
             Orange = Color.FromArgb(220, 120, 0), Grey = Color.FromArgb(110, 110, 110);
 
         readonly App app;
-        readonly Label stateVal, physVal, winVal, countersVal, hotkeyStatus;
+        readonly Label stateVal, physVal, winVal, countersVal, hotkeyStatus, remapStatus;
         readonly Button toggleBtn;
         readonly ListBox eventList;
         readonly CheckBox autoChk, trayChk, startupChk;
         readonly NumericUpDown holdNum, longNum;
-        readonly TextBox appsBox, hotkeyBox;
+        readonly TextBox appsBox, hotkeyBox, remapBox;
         bool loading;
 
         public MainForm(App app)
@@ -667,7 +796,7 @@ namespace WheelGuard
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(440, 566);
+            ClientSize = new Size(440, 592);
 
             var state = new GroupBox { Text = "Состояние", Location = new Point(10, 8), Size = new Size(420, 150) };
             AddLabel(state, "Клик колесом:", 12, 26);
@@ -691,7 +820,7 @@ namespace WheelGuard
             };
             Controls.Add(eventList);
 
-            var settings = new GroupBox { Text = "Настройки", Location = new Point(10, 318), Size = new Size(420, 196) };
+            var settings = new GroupBox { Text = "Настройки", Location = new Point(10, 318), Size = new Size(420, 226) };
             autoChk = new CheckBox { Text = "Автоотключение, если колесо зажато дольше", Location = new Point(12, 24), AutoSize = true };
             autoChk.CheckedChanged += delegate { if (loading) return; app.Config.AutoDisable = autoChk.Checked; app.SettingsChanged(); };
             settings.Controls.Add(autoChk);
@@ -717,19 +846,42 @@ namespace WheelGuard
             hotkeyStatus = AddLabel(settings, "", 128, 113);
             hotkeyStatus.ForeColor = Grey;
 
-            trayChk = new CheckBox { Text = "Показывать нажатие колеса на значке в трее", Location = new Point(12, 138), AutoSize = true };
+            AddLabel(settings, "Перебинд колеса:", 12, 120);
+            remapBox = new TextBox { Location = new Point(128, 116), Size = new Size(176, 23) };
+            remapBox.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter) { ApplyRemap(); e.SuppressKeyPress = true; return; }
+                if (e.KeyCode == Keys.Escape) { remapBox.Text = app.Config.Remap; e.SuppressKeyPress = true; return; }
+                Keys k = e.KeyCode;
+                if (k == Keys.ControlKey || k == Keys.Menu || k == Keys.ShiftKey || k == Keys.LWin || k == Keys.RWin
+                    || k == Keys.Tab || k == Keys.ProcessKey) return;
+                string mods = "";
+                if (e.Control) mods += "Ctrl+";
+                if (e.Alt) mods += "Alt+";
+                if (e.Shift) mods += "Shift+";
+                remapBox.Text = mods + k;
+                e.SuppressKeyPress = true;
+            };
+            settings.Controls.Add(remapBox);
+            var remapBtn = new Button { Text = "Применить", Location = new Point(312, 114), Size = new Size(94, 27) };
+            remapBtn.Click += delegate { ApplyRemap(); };
+            settings.Controls.Add(remapBtn);
+            remapStatus = AddLabel(settings, "", 128, 143);
+            remapStatus.ForeColor = Grey;
+
+            trayChk = new CheckBox { Text = "Показывать нажатие колеса на значке в трее", Location = new Point(12, 170), AutoSize = true };
             trayChk.CheckedChanged += delegate { if (!loading) app.SetTrayIndicator(trayChk.Checked); };
             settings.Controls.Add(trayChk);
-            startupChk = new CheckBox { Text = "Запускать вместе с Windows", Location = new Point(12, 164), AutoSize = true };
+            startupChk = new CheckBox { Text = "Запускать вместе с Windows", Location = new Point(12, 196), AutoSize = true };
             startupChk.CheckedChanged += delegate { if (!loading) app.SetStartup(startupChk.Checked); };
             settings.Controls.Add(startupChk);
             Controls.Add(settings);
 
-            var releaseBtn = new Button { Text = "Отпустить колесо в Windows", Location = new Point(10, 526), Size = new Size(210, 30) };
+            var releaseBtn = new Button { Text = "Отпустить колесо в Windows", Location = new Point(10, 552), Size = new Size(210, 30) };
             releaseBtn.Click += delegate { app.ReleaseMiddle("вручную из окна"); };
-            var logBtn = new Button { Text = "Лог", Location = new Point(228, 526), Size = new Size(90, 30) };
+            var logBtn = new Button { Text = "Лог", Location = new Point(228, 552), Size = new Size(90, 30) };
             logBtn.Click += delegate { app.OpenLog(); };
-            var exitBtn = new Button { Text = "Выход", Location = new Point(326, 526), Size = new Size(104, 30) };
+            var exitBtn = new Button { Text = "Выход", Location = new Point(326, 552), Size = new Size(104, 30) };
             exitBtn.Click += delegate { Application.Exit(); };
             Controls.AddRange(new Control[] { releaseBtn, logBtn, exitBtn });
 
@@ -761,6 +913,9 @@ namespace WheelGuard
             appsBox.Text = c.LongHoldApps;
             hotkeyBox.Text = app.HotkeyText ?? c.Hotkey;
             hotkeyStatus.Text = app.HotkeyText != null ? "работает" : "не зарегистрирован — выбери другое сочетание";
+            remapBox.Text = c.Remap;
+            remapStatus.Text = app.RemapOn ? "колесо → " + c.Remap : "выкл (клавиша, комбинация или X1/X2/Left/Right)";
+            remapStatus.ForeColor = Grey;
             trayChk.Checked = c.TrayIndicator;
             startupChk.Checked = App.IsStartup();
             loading = false;
@@ -778,6 +933,15 @@ namespace WheelGuard
             string error = app.SetHotkey(hotkeyBox.Text.Trim());
             hotkeyStatus.Text = error == null ? "работает" : "не применено: " + error;
             hotkeyStatus.ForeColor = error == null ? Grey : Red;
+        }
+
+        void ApplyRemap()
+        {
+            string error = app.SetRemap(remapBox.Text.Trim());
+            remapStatus.Text = error == null
+                ? (app.RemapOn ? "колесо → " + app.Config.Remap : "выкл")
+                : "не применено: " + error;
+            remapStatus.ForeColor = error == null ? Grey : Red;
         }
 
         public void AddEvent(string line)
